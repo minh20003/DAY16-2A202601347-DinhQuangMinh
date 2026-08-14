@@ -59,7 +59,27 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
+from arena.scorer import MAX_CLAIM_CHARS, MIN_SUPPORT_CHARS
+
 from harness.middleware import Middleware
+
+
+_WHITESPACE = re.compile(r"\s+")
+
+
+def _normalise(text: str) -> str:
+    return _WHITESPACE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def _matches_one_line(text: str, body: str) -> bool:
+    """Mirror scorer support: a normalised quote within one source line."""
+    normalised_text = _normalise(text)
+    return MIN_SUPPORT_CHARS <= len(normalised_text) <= MAX_CLAIM_CHARS and any(
+        normalised_text in _normalise(line) for line in body.splitlines()
+    )
 
 
 class CitationChecker(Middleware):
@@ -68,16 +88,58 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        corpus = ctx.corpus
+        if not isinstance(claims, list) or corpus is None:
+            return report
+
+        observed = ctx.observed_text
+        updated: list = []
+        for claim in claims:
+            if not isinstance(claim, dict):
+                updated.append(claim)
+                continue
+            text = claim.get("text")
+            raw_doc_id = claim.get("doc_id")
+            doc_id = raw_doc_id.strip() if isinstance(raw_doc_id, str) else ""
+            current = corpus.get(doc_id)
+            if (
+                isinstance(text, str)
+                and text
+                and current is not None
+                and isinstance(current.body, str)
+                and _matches_one_line(text, current.body)
+            ):
+                updated.append(
+                    claim if raw_doc_id == doc_id else {**claim, "doc_id": doc_id}
+                )
+                continue
+
+            source = None
+            if isinstance(text, str) and text:
+                for candidate in corpus.docs:
+                    if (
+                        isinstance(candidate.body, str)
+                        and candidate.body
+                        and candidate.body in observed
+                        and _matches_one_line(text, candidate.body)
+                    ):
+                        source = candidate.doc_id
+                        break
+            if source is None:
+                # Critic runs after this layer and needs fused claims intact.
+                updated.append(claim)
+            else:
+                updated.append({**claim, "doc_id": source})
+
+        report["claims"] = updated
+        report["citations"] = sorted(
+            {
+                doc_id.strip()
+                for claim in updated
+                if isinstance(claim, dict)
+                for doc_id in (claim.get("doc_id"),)
+                if isinstance(doc_id, str) and doc_id.strip()
+            }
+        )
+        return report

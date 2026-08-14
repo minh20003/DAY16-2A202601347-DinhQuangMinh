@@ -70,7 +70,66 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
+from arena.scorer import MAX_CLAIM_CHARS, MIN_SUPPORT_CHARS
+
 from harness.middleware import Middleware
+
+
+_FUSE_SEPARATORS = (", và ", "; và ", " và ", "; ")
+_WHITESPACE = re.compile(r"\s+")
+
+
+def _normalise(text: str) -> str:
+    return _WHITESPACE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def _matches_one_line(text: str, body: str) -> bool:
+    """Use the scorer's support rule without changing model text."""
+    normalised_text = _normalise(text)
+    return MIN_SUPPORT_CHARS <= len(normalised_text) <= MAX_CLAIM_CHARS and any(
+        normalised_text in _normalise(line) for line in body.splitlines()
+    )
+
+
+def _observed_quote(text: str, observed: str) -> bool:
+    """A model quote seen in one observed physical line, after normalisation."""
+    return _matches_one_line(text, observed)
+
+
+def _observed_source_ids(corpus, observed: str, fragment: str) -> list[str]:
+    """Observed documents with one physical line containing ``fragment``."""
+    if corpus is None or not fragment:
+        return []
+
+    matches: list[str] = []
+    for doc in getattr(corpus, "docs", ()):
+        body = getattr(doc, "body", None)
+        doc_id = getattr(doc, "doc_id", None)
+        if (
+            not isinstance(body, str)
+            or not body
+            or not isinstance(doc_id, str)
+            or not doc_id
+            or body not in observed
+        ):
+            continue
+        if _matches_one_line(fragment, body):
+            matches.append(doc_id)
+    return matches
+
+
+def _split_candidates(text: str, separator: str):
+    """Yield every boundary for a connector, including overlapping ones."""
+    start = 0
+    while True:
+        index = text.find(separator, start)
+        if index < 0:
+            return
+        yield text[:index].strip(), text[index + len(separator) :].strip()
+        start = index + 1
 
 
 class Critic(Middleware):
@@ -79,16 +138,65 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            claims = []
+
+        observed = ctx.observed_text
+        kept: list[dict] = []
+        recovered_conflict = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            if _observed_quote(text, observed):
+                kept.append(claim)
+                continue
+
+            source_pair = None
+            for separator in _FUSE_SEPARATORS:
+                for left, right in _split_candidates(text, separator):
+                    if not left or not right:
+                        continue
+                    left_ids = _observed_source_ids(ctx.corpus, observed, left)
+                    right_ids = _observed_source_ids(ctx.corpus, observed, right)
+                    source_pair = next(
+                        (
+                            (left_id, right_id)
+                            for left_id in left_ids
+                            for right_id in right_ids
+                            if left_id != right_id
+                        ),
+                        None,
+                    )
+                    if source_pair is not None:
+                        kept.extend(
+                            (
+                                {**claim, "text": left, "doc_id": source_pair[0]},
+                                {**claim, "text": right, "doc_id": source_pair[1]},
+                            )
+                        )
+                        recovered_conflict = True
+                        break
+                if source_pair is not None:
+                    break
+
+        report["claims"] = kept
+        if not kept:
+            report["abstain"] = True
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ trong các tài liệu đã đọc để trả lời."
+        else:
+            report["citations"] = sorted(
+                {
+                    doc_id.strip()
+                    for claim in kept
+                    for doc_id in (claim.get("doc_id"),)
+                    if isinstance(doc_id, str) and doc_id.strip()
+                }
+            )
+            if recovered_conflict:
+                report["abstain"] = True
+        return report
